@@ -84,6 +84,8 @@ def build_argparser():
                       required=True, type=str, nargs="+")
     args.add_argument("-o", "--output", help="Required. Path to a .json file with inference results",
                       required=True, type=str)
+    args.add_argument("-b", "--batch", help="Required. Inference batch size",
+                      required=True, type=int)
     args.add_argument("-l", "--cpu_extension",
                       help="Optional. Required for CPU custom layers. Absolute path to a shared library with the"
                            " kernels implementations.", type=str, default=None)
@@ -128,83 +130,103 @@ def main():
     input_blob = next(iter(net.inputs))
     out_blob = next(iter(net.outputs))
     out_blob = 'InceptionV4/Logits/Predictions'
-    net.batch_size = len(args.input)
+    net.batch_size = min(args.batch, len(args.input))
 
     # Read and pre-process input images
     n, c, h, w = net.inputs[input_blob].shape
-    images = np.ndarray(shape=(n, c, h, w))
-    for i in range(n):
-        image = cv2.imread(args.input[i])
-        
-        # handle .gif
-        if image is None:
-            log.warning("{} cv2.imread failed. Try imageio.mimread.".format(args.input[i]))
-            tmp = imageio.mimread(args.input[i])
-            assert tmp is not None, "Neither cv2 nor imageio can read this file: {}".format(args.input[i])
-            image = np.array(tmp)
-            if image.ndim == 3:
-                image = np.stack((image,)*3, axis=-1)
-            image = image[0][:,:,0:3]
-            
-        if image.shape[:-1] != (h, w):
-            log.warning("Image {} is resized from {} to {}".format(args.input[i], image.shape[:-1], (h, w)))
-            image = cv2.resize(image, (w, h))
-        image = image.transpose((2, 0, 1))  # Change data layout from HWC to CHW
-        images[i] = image
-    log.info("Batch size is {}".format(n))
-
+    log.info("Total input images: %d" % len(args.input))
+    
     # Loading model to the plugin
     log.info("Loading model to the plugin")
     exec_net = ie.load_network(network=net, device_name=args.device)
-
-    # create one inference request for asynchronous execution
-    request_id = 0
-    infer_request = exec_net.requests[request_id];
-
-    num_iter = 10
-    request_wrap = InferReqWrap(infer_request, request_id, num_iter)
-    # Start inference request execution. Wait for last execution being completed
-    request_wrap.execute("async", {input_blob: images})
-
-    # Processing output blob
-    log.info("Processing output blob")
-    res = infer_request.outputs[out_blob]
-    log.info("Top {} results: ".format(args.number_top))
-    if args.labels:
-        with open(args.labels, 'r') as f:
-            labels_map = [x.split(sep=' ', maxsplit=1)[-1].strip() for x in f]
-    else:
-        labels_map = None
-    classid_str = "classid"
-    probability_str = "probability"
     
+    # execute inference by batch
     output_json = {}
-    for i, probs in enumerate(res):
-        probs = np.squeeze(probs)
-        output_json[args.input[i].split('/')[-1]] = [str(x) for x in probs[1:]]
-        '''
-        top_ind = np.argsort(probs)[-args.number_top:][::-1]
-        print("Image {}\n".format(args.input[i]))
-        print(classid_str, probability_str)
-        print("{} {}".format('-' * len(classid_str), '-' * len(probability_str)))
-        for id in top_ind:
-            det_label = labels_map[id] if labels_map else "{}".format(id)
-            label_length = len(det_label)
-            space_num_before = (7 - label_length) // 2
-            space_num_after = 7 - (space_num_before + label_length) + 2
-            space_num_before_prob = (11 - len(str(probs[id]))) // 2
-            print("{}{}{}{}{:.7f}".format(' ' * space_num_before, det_label,
-                                          ' ' * space_num_after, ' ' * space_num_before_prob,
-                                          probs[id]))
-        print("\n")
-        '''
-    # log.info("This sample is an API example, for any performance measurements please use the dedicated benchmark_app tool\n")
-    
+    fps_hist = []
+    latency_hist = []
+    for start in range(0, len(args.input), args.batch):
+        log.info("Start batch: %d" % (start/args.batch + 1))
+        input_subset = args.input[start:start+args.batch]
+        images = np.ndarray(shape=(len(input_subset), c, h, w))
+        
+        load_img_start = time()
+        for i in range(start, start + len(input_subset)):
+            image = cv2.imread(args.input[i])
+            # handle .gif
+            if image is None:
+                # log.warning("{} cv2.imread failed. Try imageio.mimread.".format(args.input[i]))
+                tmp = imageio.mimread(args.input[i])
+                assert tmp is not None, "Neither cv2 nor imageio can read this file: {}".format(args.input[i])
+                image = np.array(tmp)
+                if image.ndim == 3:
+                    image = np.stack((image,)*3, axis=-1)
+                image = image[0][:,:,0:3]
+                
+            if image.shape[:-1] != (h, w):
+                # log.warning("Image {} is resized from {} to {}".format(args.input[i], image.shape[:-1], (h, w)))
+                image = cv2.resize(image, (w, h))
+            image = image.transpose((2, 0, 1))  # Change data layout from HWC to CHW
+            images[i-start] = image
+        log.info("Batch size is {}".format(len(input_subset)))
+        
+        # create one inference request for asynchronous execution
+        request_id = 0
+        infer_request = exec_net.requests[request_id];
+
+        num_iter = 1
+        request_wrap = InferReqWrap(infer_request, request_id, num_iter)        
+        
+        # Start inference request execution. Wait for last execution being completed
+        inf_start = time()
+        request_wrap.execute("sync", {input_blob: images})
+        
+        # Processing output blob
+        # log.info("Processing output blob")
+        res = infer_request.outputs[out_blob]
+        inf_end = time()
+        inf_time = inf_end - inf_start
+        latency = inf_end - load_img_start
+        fps_hist.append(1.0 / inf_time)
+        latency_hist.append(latency)
+        
+        # log.info("Top {} results: ".format(args.number_top))
+        if args.labels:
+            with open(args.labels, 'r') as f:
+                labels_map = [x.split(sep=' ', maxsplit=1)[-1].strip() for x in f]
+        else:
+            labels_map = None
+        classid_str = "classid"
+        probability_str = "probability"
+
+        for i, probs in enumerate(res):
+            probs = np.squeeze(probs)
+            output_json[input_subset[i].split('/')[-1]] = [str(x) for x in probs[1:]]
+            '''
+            top_ind = np.argsort(probs)[-args.number_top:][::-1]
+            print("Image {}\n".format(input_subset[i]))
+            print(classid_str, probability_str)
+            print("{} {}".format('-' * len(classid_str), '-' * len(probability_str)))
+            for id in top_ind:
+                det_label = labels_map[id] if labels_map else "{}".format(id)
+                label_length = len(det_label)
+                space_num_before = (7 - label_length) // 2
+                space_num_after = 7 - (space_num_before + label_length) + 2
+                space_num_before_prob = (11 - len(str(probs[id]))) // 2
+                print("{}{}{}{}{:.7f}".format(' ' * space_num_before, det_label,
+                                              ' ' * space_num_after, ' ' * space_num_before_prob,
+                                              probs[id]))
+            print("\n")      
+            '''      
+     
     import json
     tmp = json.dumps(output_json)
     with open(args.output, 'w') as outfile:
         outfile.write(tmp)
     log.info("Writing inference results to {}".format(args.output))
+    
+    print("Average FPS: %f" % (sum(fps_hist) / len(fps_hist)))
+    print("Average latency: %f ms" % (sum(latency_hist) / len(latency_hist) * 1000))
+
 
 if __name__ == '__main__':
     sys.exit(main() or 0)
